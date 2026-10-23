@@ -1,0 +1,5 @@
+# 核心依赖（tkinter 为 Python 自带，无需安装）
+requests>=2.31
+DrissionPage>=4.1
+moviepy>=1.0.3
+imageio-ffmpeg>=0.5

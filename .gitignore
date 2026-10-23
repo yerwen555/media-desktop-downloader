@@ -1,0 +1,32 @@
+# 运行时生成（登录状态、下载记录、日志、下载文件都在这里，绝对不要提交）
+data/
+downloads/
+config.json
+
+# 可能包含 Cookie / 记录的本地文件
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.part
+*.tmp
+.env
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 开发临时脚本 / 发布产物
+scratch/
+dist/
+release/
