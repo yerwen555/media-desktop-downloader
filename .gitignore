@@ -12,6 +12,14 @@ config.json
 *.tmp
 .env
 
+# 虚拟环境（含本地绝对路径与大量第三方包，绝不提交）
+venv/
+.venv/
+
+# pip 在项目内留下的临时目录
+pip-build-tracker-*/
+pip-install-*/
+
 # Python 缓存
 __pycache__/
 *.py[cod]

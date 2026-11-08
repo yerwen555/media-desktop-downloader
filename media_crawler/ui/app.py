@@ -18,6 +18,8 @@ from ..bilibili import (
     BiliClient,
     extract_staff,
     extract_video_refs,
+    fetch_login_cookie,
+    has_login_cookie,
     parse_space_input,
 )
 from ..config import (
@@ -63,7 +65,7 @@ class PlatformPanel(ttk.Frame):
             label_text = "B站视频链接 / BV 号 / UP 主空间："
             hint = (
                 "支持：视频链接或 BV/av 号（可多行粘贴），或 UP 主空间链接"
-                "（space.bilibili.com/数字）、纯数字 UID。"
+                "（space.bilibili.com/数字）、纯数字 UID。多 P 视频会按集列出，可直接勾选要下的分集。"
             )
             kind_choices = ("全部", "视频")
 
@@ -95,6 +97,15 @@ class PlatformPanel(ttk.Frame):
             command=self.app.stop_task,
         )
         self.stop_btn.pack(fill="x", pady=(6, 0))
+        self.login_btn: ttk.Button | None = None
+        if self.platform == "bilibili":
+            self.login_btn = ttk.Button(
+                button_col,
+                text="登录B站",
+                width=12,
+                command=lambda: self.app.bili_login(self),
+            )
+            self.login_btn.pack(fill="x", pady=(6, 0))
 
         ttk.Label(source_frame, text=hint, foreground="#777777", wraplength=1000).pack(
             anchor="w", pady=(2, 0)
@@ -107,6 +118,7 @@ class PlatformPanel(ttk.Frame):
             on_open_url=self.app.open_url,
             on_rename=lambda uid: self.app.rename_item(self, uid),
             on_details=lambda uid: self.app.show_item_details(self, uid),
+            on_expand=lambda uid: self.app.expand_pages(self, [uid]),
         )
         self.table.pack(fill="both", expand=True, pady=(4, 0))
 
@@ -119,13 +131,21 @@ class PlatformPanel(ttk.Frame):
             state="disabled",
         )
         self.download_btn.pack(side="left")
+        self.expand_btn: ttk.Button | None = None
+        if self.platform == "bilibili":
+            self.expand_btn = ttk.Button(
+                action_row,
+                text="展开选中为分P",
+                command=lambda: self.app.expand_pages(self),
+            )
+            self.expand_btn.pack(side="left", padx=(8, 0))
         ttk.Button(action_row, text="打开下载目录", command=self.app.open_download_dir).pack(
             side="left", padx=(8, 0)
         )
         ttk.Button(action_row, text="清空列表", command=self.clear).pack(side="left", padx=(8, 0))
         ttk.Label(
             action_row,
-            text="提示：默认全选，取消勾选不想要即可；双击标题改名；双击作者/作品ID 或右键看详情、合作者",
+            text="提示：默认全选，取消勾选不想要即可；多 P 视频可右键“展开为分P”后按集勾选",
             foreground="#777777",
         ).pack(side="right")
 
@@ -150,6 +170,10 @@ class PlatformPanel(ttk.Frame):
     def set_busy(self, busy: bool) -> None:
         self.crawl_btn.config(state="disabled" if busy else "normal")
         self.stop_btn.config(state="normal" if busy else "disabled")
+        if self.expand_btn is not None:
+            self.expand_btn.config(state="disabled" if busy else "normal")
+        if self.login_btn is not None:
+            self.login_btn.config(state="disabled" if busy else "normal")
         try:
             self.source_text.configure(state="disabled" if busy else "normal")
         except tk.TclError:
@@ -169,7 +193,9 @@ class MainWindow:
         self.dl_total = 0
         self._poll_job: str | None = None
 
+        warning_before = getattr(self.cfg, "dir_warning", "")
         self.cfg.ensure_dirs()
+        self.dir_warning = warning_before or getattr(self.cfg, "dir_warning", "")
         self.store = DownloadStore(DB_PATH)
         self.log = setup_logging(LOGS_DIR)
         self.log_handler = add_ui_handler(self.log, lambda msg: self._emit("log", msg))
@@ -181,6 +207,10 @@ class MainWindow:
 
         self.log.info("%s v%s 启动", APP_TITLE, APP_VERSION)
         self.log.info("%s", config_summary(self.cfg))
+        if self.dir_warning:
+            self.log.warning("%s", self.dir_warning)
+            self._append_log("警告：" + self.dir_warning)
+            self._set_status("保存目录不可用，本次已改用项目内 downloads")
         self._append_log(
             "提示：抖音首次使用需要在弹出的浏览器中扫码登录；B 站空间抓取同样会打开浏览器。"
         )
@@ -367,6 +397,10 @@ class MainWindow:
             self._on_item_done(*payload)
         elif kind == "dl_finish":
             self._on_download_finish(*payload)
+        elif kind == "expand_done":
+            self._on_expand_done(*payload)
+        elif kind == "bili_login_done":
+            self._on_bili_login_done(*payload)
 
     # ---------------- 抓取 ----------------
     def start_crawl(self, panel: PlatformPanel) -> None:
@@ -425,18 +459,33 @@ class MainWindow:
     def _on_crawl_done(self, panel: PlatformPanel, result: CrawlResult) -> None:
         self._finish_busy()
         downloaded = self.store.downloaded_map()
-        custom_titles = self.store.custom_titles()
-        for item in result.items:
-            if item.uid in custom_titles:
-                item.title = custom_titles[item.uid]
+        self._apply_custom_titles(result.items)
         panel.table.set_items(result.items, downloaded)
         if result.cookies:
             self.cookies[panel.platform] = result.cookies
+            # 浏览器里登录过 B 站：把登录态写进配置，下载时才能拿到 1080P/4K
+            if (
+                panel.platform == "bilibili"
+                and has_login_cookie(result.cookies)
+                and not self.cfg.has_bili_login()
+            ):
+                self.cfg.bili_cookie = result.cookies
+                try:
+                    self.cfg.save()
+                    self.log.info("已保存浏览器 B 站登录态（下载可获取更高清晰度）")
+                except OSError as exc:
+                    self.log.warning("保存 B 站登录态失败: %s", exc)
         for warning in result.warnings:
             self.log.warning("%s", warning)
         if result.items:
             self._set_progress(0)
-            self._set_status(f"抓取完成：共 {len(result.items)} 个作品，请勾选后下载")
+            multi = sum(1 for item in result.items if item.page_index)
+            if multi:
+                self._set_status(
+                    f"抓取完成：共 {len(result.items)} 个可下载条目（含 {multi} 个分P），请勾选后下载"
+                )
+            else:
+                self._set_status(f"抓取完成：共 {len(result.items)} 个作品，请勾选后下载")
             self.log.info(
                 "抓取完成：%s 个作品（作者：%s）",
                 len(result.items),
@@ -463,6 +512,178 @@ class MainWindow:
         self._set_status("抓取失败")
         messagebox.showerror("抓取失败", message)
 
+    def _apply_custom_titles(self, items: list[MediaItem]) -> None:
+        """把用户改过的标题套回列表条目（下载记录里按 uid 存）。"""
+        custom_titles = self.store.custom_titles()
+        if not custom_titles:
+            return
+        for item in items:
+            title = custom_titles.get(item.uid)
+            if title:
+                item.title = title
+
+    # ---------------- B 站登录（提升清晰度） ----------------
+    def bili_login(self, panel: PlatformPanel | None = None) -> None:
+        """打开浏览器等用户登录 B 站，并把 Cookie 保存到配置。"""
+        if self.busy:
+            return
+        self.busy = True
+        self.cancel = threading.Event()
+        self._set_busy(True)
+        self._set_progress(None)
+        self._set_status("请在弹出的浏览器窗口里登录 B 站（最多等 3 分钟）…")
+        self.log.info("等待 B 站登录（未登录只能 480P）…")
+        threading.Thread(target=self._bili_login_worker, daemon=True).start()
+
+    def _bili_login_worker(self) -> None:
+        cookie = ""
+        try:
+            cookie = fetch_login_cookie(self.cfg, self.log, timeout=180)
+        except Exception as exc:
+            self.log.error("浏览器登录 B 站失败: %s", exc)
+        self._emit("bili_login_done", cookie)
+
+    def _on_bili_login_done(self, cookie: str) -> None:
+        self._finish_busy()
+        self._set_progress(0)
+        if cookie:
+            self.cfg.bili_cookie = cookie
+            try:
+                self.cfg.save()
+            except OSError as exc:
+                self.log.warning("保存配置失败: %s", exc)
+            self._set_status(
+                f"B 站已登录：下载清晰度上限 {self.cfg.quality_text()}"
+            )
+            self.log.info("B 站登录成功，已保存 Cookie")
+            messagebox.showinfo(
+                "登录成功",
+                "已保存 B 站登录态。\n\n现在重新点“下载选中”，就会按设置里的清晰度上限取流"
+                f"（当前：{self.cfg.quality_text()}）。",
+                parent=self.root,
+            )
+        else:
+            self._set_status("未检测到 B 站登录，仍按 480P 下载")
+            messagebox.showwarning(
+                "登录未完成",
+                "没有检测到 SESSDATA。\n请在弹出的 Chrome 窗口里扫码登录 B 站后，"
+                "再点一次“登录B站”。",
+                parent=self.root,
+            )
+
+    # ---------------- 分P展开 ----------------
+    def expand_pages(self, panel: PlatformPanel, uids: list[str] | None = None) -> None:
+        """把“整段视频”条目展开成按分 P 的条目，便于只勾选其中几集。"""
+        if self.busy or panel.platform != "bilibili":
+            return
+        targets = uids if uids else [item.uid for item in panel.table.get_selected_items()]
+        items = [
+            panel.table.items[uid]
+            for uid in targets
+            if uid in panel.table.items and not panel.table.items[uid].page_label
+        ]
+        if not items:
+            messagebox.showinfo(
+                "提示",
+                "没有可展开的条目：请先勾选 B 站整段视频条目。\n"
+                "（已经按分P列出的条目无需再展开）",
+                parent=self.root,
+            )
+            return
+        if len(items) > 3 and not messagebox.askyesno(
+            "展开分P",
+            f"将逐条请求 B 站接口展开 {len(items)} 个视频，可能需要一些时间，是否继续？",
+            parent=self.root,
+        ):
+            return
+        self.busy = True
+        self.cancel = threading.Event()
+        self._set_busy(True)
+        self._set_progress(None)
+        self._set_status(f"正在展开分P（0/{len(items)}）…")
+        thread = threading.Thread(target=self._expand_worker, args=(panel, items), daemon=True)
+        thread.start()
+
+    def _expand_worker(self, panel: PlatformPanel, items: list[MediaItem]) -> None:
+        client = BiliClient(
+            self.cfg,
+            cookies=self.cookies.get("bilibili") or self.cfg.bili_cookie,
+            logger=self.log,
+        )
+        total = len(items)
+        expanded: dict[str, list[MediaItem]] = {}
+        warnings: list[str] = []
+        for index, item in enumerate(items):
+            if self.cancel.is_set():
+                warnings.append("已取消")
+                break
+            self._emit("status", f"正在展开分P（{index + 1}/{total}）：{item.title[:24]}…")
+            try:
+                pages = client.expand_item(item)
+            except Exception as exc:
+                warnings.append(f"{item.title}：{exc}")
+                continue
+            if pages and (len(pages) > 1 or pages[0].uid != item.uid):
+                expanded[item.uid] = pages
+            else:
+                warnings.append(f"{item.title}：只有一个分P，无需展开")
+            time.sleep(0.3)
+        self._emit("expand_done", panel, expanded, warnings)
+
+    def _on_expand_done(
+        self,
+        panel: PlatformPanel,
+        expanded: dict[str, list[MediaItem]],
+        warnings: list[str],
+    ) -> None:
+        self._finish_busy()
+        all_pages = [item for pages in expanded.values() for item in pages]
+        self._apply_custom_titles(all_pages)
+        total_new = 0
+        for parent_uid, page_items in expanded.items():
+            downloaded = self._page_downloaded_map(parent_uid, page_items)
+            total_new += len(panel.table.expand_item(parent_uid, page_items, downloaded))
+        for warning in warnings:
+            self.log.warning("展开分P: %s", warning)
+        self._set_progress(0)
+        if expanded:
+            self._set_status(
+                f"已展开 {len(expanded)} 个视频，共 {total_new} 个分P，可逐集勾选下载"
+            )
+            self._append_log(f"展开分P：{len(expanded)} 个视频 / {total_new} 个分P")
+        else:
+            self._set_status("没有可展开的分P")
+            if warnings:
+                messagebox.showinfo("展开分P", "\n".join(warnings[:6]), parent=self.root)
+        panel.update_download_button()
+        self._refresh_stats()
+
+    def _page_downloaded_map(
+        self, parent_uid: str, page_items: list[MediaItem]
+    ) -> dict[str, str]:
+        """判断哪些分 P 之前已经下载过（整段下载会存成 xxx_P3.mp4 这样的文件名）。"""
+        result: dict[str, str] = {}
+        for item in page_items:
+            record = self.store.get(item.uid)
+            files = (record or {}).get("files") or []
+            if files:
+                result[item.uid] = str(files[0])
+        parent = self.store.get(parent_uid)
+        parent_files = [str(path) for path in ((parent or {}).get("files") or [])]
+        if parent_files:
+            for item in page_items:
+                if item.uid in result:
+                    continue
+                page_no = item.page_index
+                if not page_no:
+                    continue
+                marker = f"_P{page_no}."
+                for path in parent_files:
+                    if marker in Path(path).name:
+                        result[item.uid] = path
+                        break
+        return result
+
     # ---------------- 下载 ----------------
     def start_download(self, panel: PlatformPanel) -> None:
         if self.busy:
@@ -471,6 +692,21 @@ class MainWindow:
         if not items:
             messagebox.showinfo("提示", "请先在列表中勾选要下载的作品。")
             return
+        if (
+            panel.platform == "bilibili"
+            and not self.cfg.has_bili_login()
+            and not has_login_cookie(self.cookies.get("bilibili", ""))
+        ):
+            if messagebox.askyesno(
+                "下载清晰度",
+                "当前没有 B 站登录态。\n\n"
+                "未登录时 B 站只提供 480P，所以下载会比网页版糊。\n"
+                f"设置里的清晰度是「{self.cfg.quality_text()}」，登录后才会生效。\n\n"
+                "是否现在打开浏览器登录？（登录完成后再点一次“下载选中”）",
+                parent=self.root,
+            ):
+                self.bili_login(panel)
+                return
         if not messagebox.askyesno(
             "确认下载",
             f"即将下载 {len(items)} 个作品。\n\n保存到：{self.cfg.download_dir}\n\n继续吗？",
@@ -732,13 +968,21 @@ class MainWindow:
 
     @staticmethod
     def _build_detail_text(item: MediaItem, record: dict | None, error: str = "") -> str:
-        type_text = item.type_text + ("（合作/联合投稿）" if item.is_collab else "")
+        type_text = item.display_kind
         lines = [
             f"标题：{item.title}",
             f"平台：{item.platform_text}    类型：{type_text}",
             f"作品ID：{item.item_id}",
             f"主作者：{item.author_safe}" + (f"（ID：{item.author_id}）" if item.author_id else ""),
         ]
+        if item.page_label:
+            part = str(item.payload.get("part") or "").strip()
+            lines.append(f"分P：{item.page_label}" + (f"（{part}）" if part else ""))
+        elif item.platform == "bilibili" and item.is_multi_page:
+            lines.append(
+                f"分P：共 {item.page_count}P —— 这是整段条目，"
+                "可右键“展开为分P”后只下其中几集"
+            )
         if item.collaborators:
             lines.append("合作者：" + "、".join(item.collaborators))
         elif item.platform == "bilibili":

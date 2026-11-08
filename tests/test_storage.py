@@ -42,6 +42,18 @@ def test_stale_record_cleanup(work_temp):
     assert store.get(item.uid) is None
 
 
+def test_stale_record_kept_when_drive_unavailable(work_temp, monkeypatch):
+    store = DownloadStore(work_temp / "media.db")
+    item = _item("douyin:drive")
+    missing = work_temp / "missing.mp4"
+    store.mark(item, [str(missing)], size=0)
+    monkeypatch.setattr("media_crawler.storage.path_root_available", lambda _path: False)
+
+    downloaded = store.downloaded_map(check_files=True)
+    assert downloaded == {item.uid: str(missing)}
+    assert store.get(item.uid) is not None
+
+
 def test_stats_and_clear(work_temp):
     store = DownloadStore(work_temp / "media.db")
     video_file = work_temp / "v.mp4"

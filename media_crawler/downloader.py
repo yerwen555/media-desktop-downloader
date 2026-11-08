@@ -15,7 +15,7 @@ from .config import AppConfig
 from .douyin import DouyinCrawler
 from .models import DownloadSummary, ItemOutcome, MediaItem
 from .net import build_session
-from .storage import DownloadStore
+from .storage import DownloadStore, path_root_available
 
 StartCb = Callable[[MediaItem], None]
 ProgressCb = Callable[[str, float], None]
@@ -70,6 +70,11 @@ class DownloadManager:
                     if files:
                         self.log.info("已下载，跳过: %s", item.title)
                         return ItemOutcome(item.uid, item.title, True, files, skipped=True)
+                    if any(not path_root_available(p) for p in record.get("files", [])):
+                        self.log.warning("保存文件所在磁盘暂时不可用，跳过: %s", item.title)
+                        return ItemOutcome(
+                            item.uid, item.title, True, record.get("files", []), skipped=True
+                        )
                     self.store.remove(item.uid)
 
             def progress_callback(fraction: float) -> None:

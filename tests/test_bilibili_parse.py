@@ -97,6 +97,57 @@ def test_view_to_item_union_staff():
     assert item.is_collab is True
 
 
+def test_view_to_items_expands_multi_p():
+    items = BiliClient._view_to_items(VIEW_MULTI_P)
+    assert [item.uid for item in items] == [
+        "bilibili:BV1xx411c7mD:111",
+        "bilibili:BV1xx411c7mD:222",
+    ]
+    first, second = items
+    assert first.title == "P1 P1 - 测试视频"
+    assert first.page_index == 1
+    assert first.page_count == 2
+    assert first.page_label == "P1/2"
+    assert first.duration_ms == 60_000
+    assert first.page_url == "https://www.bilibili.com/video/BV1xx411c7mD?p=1"
+    assert first.payload["pages"] == [{"cid": 111, "page": 1, "part": "P1", "duration": 60}]
+    assert second.page_label == "P2/2"
+    assert second.display_kind == "视频·P2/2"
+    assert second.page_url.endswith("?p=2")
+
+
+def test_view_to_items_without_expand_keeps_aggregate():
+    items = BiliClient._view_to_items(VIEW_MULTI_P, expand_pages=False)
+    assert len(items) == 1
+    assert items[0].uid == "bilibili:BV1xx411c7mD"
+    assert items[0].title == "测试视频（2P）"
+    assert items[0].page_count == 2
+    assert items[0].page_label == ""
+
+
+def test_expand_item_uses_view_info(monkeypatch):
+    aggregate = BiliClient._view_to_items(VIEW_MULTI_P, expand_pages=False)[0]
+    monkeypatch.setattr(
+        BiliClient, "view_info", lambda self, bvid=None, aid=None: VIEW_MULTI_P
+    )
+    client = BiliClient.__new__(BiliClient)
+    pages = client.expand_item(aggregate)
+    assert len(pages) == 2
+    assert all(item.page_index for item in pages)
+
+
+def test_build_page_filename_keeps_suffix():
+    page_item = BiliClient._view_to_items(VIEW_MULTI_P)[1]
+    name = bilibili.build_page_filename(page_item, {"page": 2, "cid": 222}, 94)
+    assert "BV1xx411c7mD" in name
+    assert "测试视频" in name
+    assert "P1 P1 -" not in name
+    assert "（94P）" in name  # 与旧版整段下载的文件名一致，升级后能识别已下载
+    assert name.endswith("_P2.mp4")
+    single = bilibili.build_page_filename(page_item, {"page": 1, "cid": 111}, 1)
+    assert "_P1" not in single and single.endswith(".mp4")
+
+
 def test_parse_space_item():
     raw = {
         "bvid": "BV1yy411c7mD",
@@ -183,6 +234,71 @@ def test_pick_dash_streams():
     assert high is not None and high["video"] == ["u64"]
 
     assert BiliClient._pick_dash_streams({"video": []}, 80) is None
+
+
+DASH_MULTI = {
+    "video": [
+        {"id": 120, "width": 3840, "height": 2160, "frameRate": "60", "codecid": 13,
+         "bandwidth": 9_000_000, "baseUrl": "u4k_av1"},
+        {"id": 120, "width": 3840, "height": 2160, "frameRate": "60", "codecid": 7,
+         "bandwidth": 20_000_000, "baseUrl": "u4k_avc"},
+        {"id": 116, "width": 1920, "height": 1080, "frameRate": "60", "codecid": 7,
+         "bandwidth": 8_000_000, "baseUrl": "u1080p60"},
+        {"id": 80, "width": 1920, "height": 1080, "frameRate": "30", "codecid": 7,
+         "bandwidth": 3_000_000, "baseUrl": "u1080"},
+        {"id": 32, "width": 854, "height": 480, "frameRate": "30", "codecid": 7,
+         "bandwidth": 400_000, "baseUrl": "u480"},
+    ],
+    "audio": [{"id": 30280, "bandwidth": 320_000, "baseUrl": "a320"}],
+}
+
+
+def test_pick_dash_streams_respects_quality_cap():
+    # 127 = 最高可用：4K，同清晰度优先 AVC（不黑屏）
+    top = BiliClient._pick_dash_streams(DASH_MULTI, 127)
+    assert top is not None
+    assert top["video"] == ["u4k_avc"]
+    assert top["quality"] == "4K（3840×2160@60fps）"
+    assert top["audio"] == ["a320"]
+
+    # 上限 116：只能到 1080P60
+    p60 = BiliClient._pick_dash_streams(DASH_MULTI, 116)
+    assert p60 is not None and p60["video"] == ["u1080p60"]
+
+    # 上限 80：1080P30
+    p30 = BiliClient._pick_dash_streams(DASH_MULTI, 80)
+    assert p30 is not None and p30["video"] == ["u1080"]
+
+    # 上限 32：480P（未登录的真实情况）
+    low = BiliClient._pick_dash_streams(DASH_MULTI, 32)
+    assert low is not None and low["video"] == ["u480"]
+
+
+def test_playurl_asks_for_full_dash_features(monkeypatch):
+    client = BiliClient.__new__(BiliClient)
+    seen = {}
+
+    def fake_get_json(self, url, params=None, **kwargs):
+        seen["params"] = dict(params or {})
+        seen["wbi"] = bool(kwargs.get("wbi"))
+        return {"code": 0, "data": {"dash": DASH_MULTI, "quality": 120}}
+
+    monkeypatch.setattr(BiliClient, "_get_json", fake_get_json)
+    stream = client.playurl("BV1xx411c7mD", 111, 127)
+    # fnval=4048 才会返回 4K / 60fps / HDR / AV1 等全部特性
+    assert seen["params"]["fnval"] == 4048
+    assert seen["params"]["qn"] == 127
+    assert seen["params"]["fourk"] == 1
+    assert seen["wbi"] is True
+    assert stream["video"] == ["u4k_avc"]
+    assert stream["id"] == 120
+
+
+def test_has_login_cookie():
+    assert bilibili.has_login_cookie("SESSDATA=abc123; bili_jct=x") is True
+    assert bilibili.has_login_cookie("SESSDATA=; bili_jct=x") is False
+    assert bilibili.has_login_cookie("") is False
+    assert bilibili.has_login_cookie("buvid3=abc") is False
 
 
 def test_stream_urls_backup():

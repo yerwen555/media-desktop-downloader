@@ -12,6 +12,24 @@ from pathlib import Path
 
 from .models import MediaItem
 
+def path_root_available(path: str | Path) -> bool:
+    """文件所在的盘符/网络盘根当前是否可访问。
+
+    移动硬盘或网络盘没连接时，文件路径看起来“不存在”，但这不等于文件被删除；
+    这时不能清理下载记录，否则重新插回磁盘后会丢失去重信息。
+    """
+    try:
+        anchor = Path(path).anchor
+    except (TypeError, ValueError, OSError):
+        return True
+    if not anchor:
+        return True
+    try:
+        return Path(anchor).exists()
+    except OSError:
+        return False
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS downloads (
     uid         TEXT PRIMARY KEY,
@@ -158,6 +176,10 @@ class DownloadStore:
                 files = []
             path = files[0] if files else ""
             if check_files and path and not Path(path).exists():
+                if not path_root_available(path):
+                    # 磁盘/网络盘暂时不可用：保留记录，等插回后继续使用
+                    result[uid] = path
+                    continue
                 stale.append(uid)
                 continue
             result[uid] = path

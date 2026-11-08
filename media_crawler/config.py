@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 APP_TITLE = "抖音 / B站 视频下载助手"
-APP_VERSION = "2.2"
+APP_VERSION = "2.4"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
@@ -24,6 +24,21 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+QUALITY_TEXT = {
+    127: "最高可用（4K/1080P60 自动降级）",
+    126: "杜比视界",
+    125: "HDR",
+    120: "4K",
+    116: "1080P60",
+    112: "1080P+",
+    80: "1080P",
+    74: "720P60",
+    64: "720P",
+    32: "480P",
+    16: "360P",
+}
 
 
 @dataclass
@@ -46,7 +61,9 @@ class AppConfig:
 
     # ---- B 站 ----
     bili_max_count: int = 600
-    bili_quality: int = 80  # 80=1080P, 64=720P, 32=480P（未登录时自动降级）
+    # 清晰度“上限”：127=最高可用（4K/1080P60/DASH 全特性），120=4K，116=1080P60，
+    # 112=1080P+，80=1080P，74=720P60，64=720P，32=480P；未登录时 B 站只会给到 480P。
+    bili_quality: int = 127
     bili_download_delay: float = 0.5
     bili_cookie: str = ""  # 可选：手动 Cookie，填了可下载更高清晰度
 
@@ -97,15 +114,42 @@ class AppConfig:
 
     # ---------- 路径 ----------
     def ensure_dirs(self) -> None:
-        for directory in (DATA_DIR, LOGS_DIR, TMP_DIR, Path(self.download_dir)):
+        # 程序数据目录必须可用（项目内）
+        for directory in (DATA_DIR, LOGS_DIR, TMP_DIR):
             directory.mkdir(parents=True, exist_ok=True)
+
+        # 下载目录可能在移动硬盘/网络盘上：不可用时临时回退，保证程序能启动
+        previous_warning = getattr(self, "dir_warning", "")
+        self.dir_warning = previous_warning
+        try:
+            Path(self.download_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            original = self.download_dir
+            try:
+                DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                raise exc
+            self.download_dir = str(DOWNLOAD_DIR)
+            self.dir_warning = (
+                f"保存目录不可用：{original}（{exc}）。"
+                f"本次已临时改用项目内的 {DOWNLOAD_DIR}；"
+                "插回磁盘/恢复网络盘后重新启动即可恢复，也可以到“设置”里修改保存目录。"
+            )
 
     def platform_dir(self, platform: str) -> Path:
         name = "抖音" if platform == "douyin" else "B站"
         return Path(self.download_dir) / name
 
     def quality_text(self) -> str:
-        return {80: "1080P", 64: "720P", 32: "480P"}.get(int(self.bili_quality), f"qn={self.bili_quality}")
+        return QUALITY_TEXT.get(int(self.bili_quality), f"qn={self.bili_quality}")
+
+    def has_bili_login(self) -> bool:
+        """配置里是否已经存了可用的 B 站登录 Cookie（未登录最高只有 480P）。"""
+        for part in (self.bili_cookie or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name.strip() == "SESSDATA" and value.strip():
+                return True
+        return False
 
     def temp_dir(self) -> Path:
         TMP_DIR.mkdir(parents=True, exist_ok=True)

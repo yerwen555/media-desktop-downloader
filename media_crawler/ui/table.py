@@ -11,7 +11,7 @@ from ..models import MediaItem
 
 _COLUMNS = (
     ("sel", "选", 40, "center", False),
-    ("kind", "类型", 86, "center", False),
+    ("kind", "类型", 104, "center", False),
     ("title", "标题", 330, "w", True),
     ("id", "作品ID", 150, "center", False),
     ("length", "时长/张数", 80, "center", False),
@@ -36,6 +36,7 @@ class ResultsTable(ttk.Frame):
         on_open_url: Callable[[str], None] | None = None,
         on_rename: Callable[[str], None] | None = None,
         on_details: Callable[[str], None] | None = None,
+        on_expand: Callable[[str], None] | None = None,
     ):
         super().__init__(master)
         self.items: dict[str, MediaItem] = {}
@@ -48,6 +49,7 @@ class ResultsTable(ttk.Frame):
         self._on_open_url = on_open_url
         self._on_rename = on_rename
         self._on_details = on_details
+        self._on_expand = on_expand
         self._sort_column: str | None = None
         self._sort_reverse = False
         self._filter_job: str | None = None
@@ -153,6 +155,44 @@ class ResultsTable(ttk.Frame):
         self.status_text.clear()
         self.status_tag.clear()
         self.refresh()
+
+    def expand_item(
+        self,
+        uid: str,
+        new_items: list[MediaItem],
+        downloaded: dict[str, str] | None = None,
+    ) -> list[str]:
+        """把一条“整段视频”原位替换成若干分 P 条目，返回新条目的 uid。"""
+        if uid not in self.items or not new_items:
+            return []
+        index = self.order.index(uid) if uid in self.order else len(self.order)
+        was_selected = uid in self.selected
+
+        self.items.pop(uid, None)
+        self.selected.discard(uid)
+        self.downloaded.pop(uid, None)
+        self.status_text.pop(uid, None)
+        self.status_tag.pop(uid, None)
+        if uid in self.order:
+            self.order.remove(uid)
+
+        extra_downloaded = dict(downloaded or {})
+        new_uids = [item.uid for item in new_items]
+        self.order[index:index] = new_uids
+        for item in new_items:
+            self.items[item.uid] = item
+            if item.uid in extra_downloaded:
+                self.downloaded[item.uid] = extra_downloaded[item.uid]
+            self.status_text.pop(item.uid, None)
+            self.status_tag.pop(item.uid, None)
+            if was_selected:
+                self.selected.add(item.uid)
+
+        if self.tree.exists(uid):
+            self.tree.delete(uid)
+        self.refresh()
+        self._changed()
+        return new_uids
 
     def mark_downloaded(self, uid: str, path: str = "") -> None:
         self.downloaded[uid] = path
@@ -303,7 +343,7 @@ class ResultsTable(ttk.Frame):
         author = item.author_table
         if len(author) > 18:
             author = author[:17] + "…"
-        kind_text = item.type_text + ("·合作" if item.is_collab else "")
+        kind_text = item.display_kind
         return (
             selected,
             kind_text,
@@ -407,6 +447,10 @@ class ResultsTable(ttk.Frame):
         if self._on_details is not None and uid in self.items:
             self._on_details(uid)
 
+    def _request_expand(self, uid: str) -> None:
+        if self._on_expand is not None and uid in self.items:
+            self._on_expand(uid)
+
     def _on_right_click(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
@@ -419,6 +463,12 @@ class ResultsTable(ttk.Frame):
             command=lambda: self._request_details(row),
         )
         menu.add_command(label="重命名标题…", command=lambda: self._request_rename(row))
+        expandable = bool(item) and item.platform == "bilibili" and not item.page_label
+        menu.add_command(
+            label="展开为分P…",
+            command=(lambda: self._request_expand(row)) if expandable else None,
+            state=("normal" if (expandable and self._on_expand) else "disabled"),
+        )
         menu.add_command(
             label="在浏览器中打开",
             command=(lambda: self._on_open_url(item.page_url))

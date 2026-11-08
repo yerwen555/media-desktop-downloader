@@ -43,7 +43,22 @@ _BV_RE = re.compile(r"BV[0-9A-Za-z]{10}")
 _AV_RE = re.compile(r"(?<![0-9A-Za-z])[aA][vV](\d+)")
 _SPACE_RE = re.compile(r"space\.bilibili\.com/(\d+)", re.I)
 _MID_RE = re.compile(r"[?&]mid=(\d+)")
-_QUALITY_NAMES = {16: "360P", 32: "480P", 64: "720P", 80: "1080P", 112: "1080P+", 116: "1080P60", 120: "4K"}
+_QUALITY_NAMES = {
+    16: "360P",
+    32: "480P",
+    64: "720P",
+    74: "720P60",
+    80: "1080P",
+    112: "1080P+",
+    116: "1080P60",
+    120: "4K",
+    125: "HDR",
+    126: "杜比视界",
+    127: "8K",
+}
+# codecid: 7=AVC(H.264) 12=HEVC(H.265) 13=AV1；同清晰度优先 AVC（兼容性最好、不黑屏）
+_CODEC_RANK = {7: 3, 0: 2, 12: 1, 13: 0}
+_CODEC_NAMES = {7: "AVC", 12: "HEVC", 13: "AV1"}
 
 # WBI 签名混淆表（B 站前端固定表）
 MIXIN_KEY_ENC_TAB = [
@@ -273,8 +288,18 @@ class BiliClient:
             raise BiliApiError("获取视频信息失败: 返回数据为空")
         return data
 
-    def video_items(self, refs: list[str], progress: ProgressCb | None = None) -> CrawlResult:
-        """把 BV/av 号解析成可勾选的视频条目。"""
+    def video_items(
+        self,
+        refs: list[str],
+        progress: ProgressCb | None = None,
+        *,
+        expand_pages: bool = True,
+    ) -> CrawlResult:
+        """把 BV/av 号解析成可勾选的视频条目。
+
+        expand_pages=True 时，多 P 视频会在列表阶段就拆成“每 P 一行”，
+        用户可以直接勾选想下载的某几集，而不是整段视频一起下。
+        """
         result = CrawlResult()
         total = len(refs)
         for index, ref in enumerate(refs):
@@ -285,22 +310,18 @@ class BiliClient:
                     data = self.view_info(aid=int(ref[2:]))
                 else:
                     data = self.view_info(bvid=ref)
-                item = self._view_to_item(data)
-                if item is not None:
-                    result.items.append(item)
+                result.items.extend(self._view_to_items(data, expand_pages=expand_pages))
             except (BiliApiError, ValueError) as exc:
                 result.warnings.append(f"{ref}: {exc}")
                 self.log.warning("解析 %s 失败: %s", ref, exc)
             time.sleep(0.25)
         if progress is not None:
-            progress(total, f"解析完成，共 {len(result.items)} 个视频")
+            progress(total, f"解析完成，共 {len(result.items)} 个可下载条目")
         return result
 
+    # ---------- 视频信息 → 列表条目 ----------
     @staticmethod
-    def _view_to_item(view: dict[str, Any]) -> MediaItem | None:
-        bvid = str(view.get("bvid") or "").strip()
-        if not bvid:
-            return None
+    def _view_pages(view: dict[str, Any]) -> list[dict[str, Any]]:
         pages_raw = view.get("pages")
         pages: list[dict[str, Any]] = []
         if isinstance(pages_raw, list) and pages_raw:
@@ -319,7 +340,112 @@ class BiliClient:
         if not pages:
             cid = view.get("cid")
             if cid:
-                pages = [{"cid": int(cid), "page": 1, "part": "", "duration": int(view.get("duration") or 0)}]
+                pages = [
+                    {
+                        "cid": int(cid),
+                        "page": 1,
+                        "part": "",
+                        "duration": int(view.get("duration") or 0),
+                    }
+                ]
+        return pages
+
+    @staticmethod
+    def _common_view_fields(view: dict[str, Any]) -> dict[str, Any]:
+        """view 接口里与分 P 无关的公共字段。"""
+        bvid = str(view.get("bvid") or "").strip()
+        owner = view.get("owner") if isinstance(view.get("owner"), dict) else {}
+        owner_name, owner_mid, collaborators, is_union = extract_staff(view)
+        stat = view.get("stat") if isinstance(view.get("stat"), dict) else {}
+        pic = str(view.get("pic") or "")
+        if pic.startswith("//"):
+            pic = "https:" + pic
+        return {
+            "bvid": bvid,
+            "aid": int(view.get("aid") or 0),
+            "title": str(view.get("title") or f"视频_{bvid}").strip(),
+            "author": str(owner.get("name") or "").strip(),
+            "owner_mid": owner_mid,
+            "collaborators": list(collaborators),
+            "is_union": bool(is_union),
+            "views": int(stat.get("view") or 0),
+            "pubdate": int(view.get("pubdate") or 0),
+            "pic": pic,
+        }
+
+    @classmethod
+    def _view_to_items(
+        cls, view: dict[str, Any], *, expand_pages: bool = True
+    ) -> list[MediaItem]:
+        """把一个 view 响应当成列表条目返回。
+
+        - 多 P 且 expand_pages=True：每个分 P 一个条目（uid 带 cid）；
+        - 其它情况：整段视频一个条目（uid 只有 BV 号，兼容旧记录）。
+        """
+        pages = cls._view_pages(view)
+        if not pages:
+            return []
+        if not expand_pages or len(pages) <= 1:
+            item = cls._view_to_item(view)
+            return [item] if item is not None else []
+        page_count = len(pages)
+        return [cls._page_item(view, page, page_count) for page in pages]
+
+    @classmethod
+    def _page_item(
+        cls, view: dict[str, Any], page: dict[str, Any], page_count: int
+    ) -> MediaItem:
+        common = cls._common_view_fields(view)
+        bvid = common["bvid"]
+        page_no = int(page.get("page") or 1)
+        part = str(page.get("part") or "").strip()
+        prefix = f"P{page_no} {part}".strip()
+        # 分P 名放最前面：多P视频标题往往很长，列表里才能一眼看出是第几集
+        title = f"{prefix} - {common['title']}" if prefix else common["title"]
+        return MediaItem(
+            platform="bilibili",
+            uid=f"bilibili:{bvid}:{int(page['cid'])}",
+            kind="video",
+            title=title,
+            author=common["author"],
+            create_time=common["pubdate"],
+            duration_ms=int(page.get("duration") or 0) * 1000,
+            views=common["views"],
+            cover_url=common["pic"],
+            page_url=f"https://www.bilibili.com/video/{bvid}?p={page_no}",
+            payload={
+                "bvid": bvid,
+                "aid": common["aid"],
+                "cid": int(page["cid"]),
+                "page": page_no,
+                "page_count": page_count,
+                "part": part,
+                "video_title": common["title"],
+                "pages": [page],
+            },
+            author_id=common["owner_mid"],
+            collaborators=common["collaborators"],
+            collab_flag=common["is_union"],
+        )
+
+    def expand_item(self, item: MediaItem) -> list[MediaItem]:
+        """把列表里的“整段视频”条目展开成按分 P 的条目。"""
+        if item.page_label:
+            return [item]
+        bvid = str(item.payload.get("bvid") or item.uid.split(":")[-1])
+        view = self.view_info(bvid=bvid)
+        items = self._view_to_items(view, expand_pages=True)
+        if not items:
+            raise BiliApiError("该视频没有可用的分P信息")
+        return items
+
+    @staticmethod
+    def _view_to_item(view: dict[str, Any]) -> MediaItem | None:
+        """整段视频条目（旧结构：uid 只带 BV 号，payload 里放全部分 P）。"""
+        bvid = str(view.get("bvid") or "").strip()
+        if not bvid:
+            return None
+        pages = BiliClient._view_pages(view)
         if not pages:
             return None
 
@@ -488,11 +614,15 @@ class BiliClient:
 
     # ---------- 取流 ----------
     def playurl(self, bvid: str, cid: int, qn: int) -> dict[str, Any]:
-        """返回 {"type": "dash"|"durl", "video": [...], "audio": [...], "quality": str}。"""
+        """返回 {"type": "dash"|"durl", "video": [...], "audio": [...], "quality": str}。
+
+        fnval=4048 才会返回 4K/1080P60/HDR/杜比/AV1 等全部 DASH 特性；
+        只会返回账号权限内的清晰度（未登录最高 480P）。
+        """
         attempts = [
-            (True, 16),   # WBI + DASH（推荐）
-            (False, 1),   # 普通 MP4 兜底
-            (False, 16),  # 无签名的 DASH 兜底
+            (True, 4048),  # WBI + DASH 全特性（4K/60fps/HDR/8K）
+            (True, 16),    # 老版 DASH 兜底
+            (False, 1),    # 普通 MP4 兜底
         ]
         errors: list[str] = []
         for use_wbi, fnval in attempts:
@@ -517,7 +647,7 @@ class BiliClient:
                 continue
             data = payload.get("data") or {}
             dash = data.get("dash") if isinstance(data.get("dash"), dict) else None
-            if fnval & 16 and dash:
+            if dash and not (fnval & 1):
                 stream = self._pick_dash_streams(dash, qn)
                 if stream:
                     return stream
@@ -541,14 +671,23 @@ class BiliClient:
 
     @staticmethod
     def _pick_dash_streams(dash: dict[str, Any], qn: int) -> dict[str, Any] | None:
+        """在接口返回的 DASH 流里挑“不超过 qn 的最高清晰度”。
+
+        qn 是上限（127 表示最高可用）；B 站只返回账号权限内的流，
+        所以未登录时这里最多只能挑到 480P。
+        """
         videos = [v for v in (dash.get("video") or []) if isinstance(v, dict)]
         audios = [a for a in (dash.get("audio") or []) if isinstance(a, dict)]
         if not videos:
             return None
-        eligible = [v for v in videos if int(v.get("id") or 0) <= qn] or videos
+        eligible = [v for v in videos if 0 < int(v.get("id") or 0) <= qn] or videos
         best = max(
             eligible,
-            key=lambda v: (int(v.get("id") or 0), int(v.get("bandwidth") or 0)),
+            key=lambda v: (
+                int(v.get("id") or 0),
+                _CODEC_RANK.get(int(v.get("codecid") or 0), 0),
+                int(v.get("bandwidth") or 0),
+            ),
         )
         video_urls = _stream_urls(best)
         if not video_urls:
@@ -557,16 +696,24 @@ class BiliClient:
         if audios:
             best_audio = max(audios, key=lambda a: int(a.get("bandwidth") or 0))
             audio_urls = _stream_urls(best_audio)
-        quality = _QUALITY_NAMES.get(int(best.get("id") or 0), f"qn{best.get('id')}")
+        stream_id = int(best.get("id") or 0)
+        quality = _QUALITY_NAMES.get(stream_id, f"qn{stream_id}")
         width = best.get("width")
         height = best.get("height")
+        fps = best.get("frameRate") or best.get("frame_rate")
+        detail = quality
         if width and height:
-            quality = f"{quality}（{width}×{height}）"
+            detail = f"{quality}（{width}×{height}"
+            if fps:
+                detail += f"@{int(float(fps))}fps"
+            detail += "）"
         return {
             "type": "dash",
+            "id": stream_id,
+            "codecid": int(best.get("codecid") or 0),
             "video": video_urls,
             "audio": audio_urls,
-            "quality": quality,
+            "quality": detail,
         }
 
     # ---------- 下载 ----------
@@ -585,22 +732,22 @@ class BiliClient:
             return ItemOutcome(item.uid, item.title, False, error="没有可下载的分 P")
 
         bvid = str(item.payload.get("bvid") or item.uid.split(":")[-1])
-        title = sanitize_name(strip_html(item.title), 70)
-        date_prefix = item.date_text if item.date_text != "-" else ""
         author = sanitize_name(item.author or "未知作者", 40)
         out_dir = cfg.platform_dir("bilibili") / author
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        total_pages = len(pages)
+        # 列表阶段就展开成“单 P 条目”时，payload 里带 page_count（总分 P 数），
+        # 用文件名仍保留 _P{n} 后缀，保持与整段下载一致、也避免各 P 互相覆盖。
+        total_pages = int(item.payload.get("page_count") or 0) or len(pages)
         planned: list[tuple[dict[str, Any], Path]] = []
         for page in pages:
-            suffix = f"_P{page['page']}" if total_pages > 1 else ""
-            filename = f"{date_prefix}_{title}_{bvid}{suffix}.mp4".lstrip("_")
-            planned.append((page, out_dir / sanitize_name(filename, 150)))
+            filename = build_page_filename(item, page, total_pages)
+            planned.append((page, out_dir / filename))
 
         files: list[str] = []
         errors: list[str] = []
         total_bytes = 0
+        last_quality = ""
         for page_index, (page, dest) in enumerate(planned):
             if cancel is not None and cancel.is_set():
                 errors.append("已取消")
@@ -620,7 +767,7 @@ class BiliClient:
                 f"（P{page['page']}）" if total_pages > 1 else "",
             )
             try:
-                written = self._download_page(
+                written, quality = self._download_page(
                     bvid=bvid,
                     cid=int(page["cid"]),
                     dest=dest,
@@ -630,12 +777,15 @@ class BiliClient:
                 )
                 files.append(str(dest))
                 total_bytes += written
+                last_quality = quality
             except (BiliApiError, OSError) as exc:
                 errors.append(f"P{page['page']}: {exc}")
                 self.log.error("B 站视频下载失败 %s: %s", dest.name, exc)
             time.sleep(cfg.bili_download_delay)
 
         if files:
+            if last_quality:
+                self.log.info("实际下载清晰度：%s", last_quality)
             return ItemOutcome(item.uid, item.title, True, files, error="；".join(errors))
         return ItemOutcome(
             item.uid, item.title, False, error="；".join(errors) or "下载失败"
@@ -669,14 +819,22 @@ class BiliClient:
         cfg: AppConfig,
         progress: ItemProgressCb | None,
         cancel: threading.Event | None,
-    ) -> int:
+    ) -> tuple[int, str]:
         stream = self.playurl(bvid, cid, int(cfg.bili_quality))
         headers = {
             "Referer": f"https://www.bilibili.com/video/{bvid}",
             "Origin": "https://www.bilibili.com",
         }
         dest.parent.mkdir(parents=True, exist_ok=True)
-        self.log.info("清晰度: %s", stream.get("quality", "未知"))
+        quality = str(stream.get("quality") or "未知")
+        self.log.info("清晰度: %s", quality)
+        stream_id = int(stream.get("id") or 0)
+        if stream_id and stream_id <= 32 and not self.cookies:
+            self.log.warning(
+                "当前未登录 B 站，接口最高只给 %s（网页版能看高清是因为浏览器已登录）。"
+                "在 B 站标签页点“登录B站”后再下载即可拿到 1080P/1080P60/4K。",
+                quality,
+            )
 
         def scaled(start: float, span: float):
             def callback(done: int, total: int) -> None:
@@ -696,7 +854,7 @@ class BiliClient:
             )
             if not result.ok:
                 raise BiliApiError(result.error)
-            return result.bytes_written
+            return result.bytes_written, quality
 
         # 注意：这里刻意不用 tempfile.mkdtemp（某些受限环境会给它生成无法写入的 ACL），
         # 改用应用自己的临时目录，并在 finally 中尽力清理。
@@ -735,12 +893,28 @@ class BiliClient:
             _merge_av(video_tmp, audio_tmp if stream["audio"] else None, dest)
             if progress is not None:
                 progress(1.0)
-            return video_res.bytes_written + audio_bytes
+            return video_res.bytes_written + audio_bytes, quality
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ==================== 采集辅助 ====================
+def build_page_filename(item: MediaItem, page: dict[str, Any], page_count: int) -> str:
+    """分 P 文件名：日期_标题_BV号[_P{n}].mp4（多 P 视频必须带 P 号，避免互相覆盖）。"""
+    bvid = str(item.payload.get("bvid") or item.uid.split(":")[-1])
+    # 分P 条目的 title 前面带了“P1 xxx - ”，文件名用原始视频标题；
+    # 多 P 时补上“（94P）”，与旧版整段下载的文件名保持一致，升级后不会重复下载。
+    raw_title = str(item.payload.get("video_title") or item.title)
+    if page_count > 1:
+        marker = f"（{page_count}P）"
+        if marker not in raw_title:
+            raw_title = f"{raw_title}{marker}"
+    title = sanitize_name(strip_html(raw_title), 70)
+    date_prefix = item.date_text if item.date_text != "-" else ""
+    suffix = f"_P{page['page']}" if page_count > 1 else ""
+    return sanitize_name(f"{date_prefix}_{title}_{bvid}{suffix}.mp4".lstrip("_"), 150)
+
+
 def _parse_arc_response(body: Any) -> tuple[list[dict[str, Any]], int | None]:
     """从 UP 主空间监听到的 arc/search 响应里取 vlist。"""
     if isinstance(body, (bytes, bytearray)):
@@ -868,6 +1042,39 @@ def _dom_items(page) -> list[MediaItem]:
             )
         )
     return items
+
+
+def has_login_cookie(cookie_str: str) -> bool:
+    """Cookie 串里是否带有效的 SESSDATA（B 站登录标志）。"""
+    for part in (cookie_str or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name.strip() == "SESSDATA" and value.strip():
+            return True
+    return False
+
+
+def fetch_login_cookie(
+    cfg: AppConfig,
+    logger: logging.Logger | None = None,
+    timeout: float = 180.0,
+) -> str:
+    """打开浏览器让用户扫码登录 B 站，返回导出的 Cookie 串（失败返回空串）。
+
+    未登录时 B 站 playurl 只给 360P/480P，登录后才有 1080P/1080P60/4K。
+    """
+    log = logger or logging.getLogger("media_crawler")
+    with BrowserSession(headless=False) as page:
+        log.info("已打开浏览器，请在页面中登录 B 站（最多等待 %d 秒）…", int(timeout))
+        page.get("https://www.bilibili.com/")
+        deadline = time.time() + max(20.0, timeout)
+        while time.time() < deadline:
+            time.sleep(2.0)
+            cookie_str = _cookies(page)
+            if has_login_cookie(cookie_str):
+                log.info("检测到 B 站登录态，已导出 Cookie")
+                return cookie_str
+        log.warning("等待登录超时，没有拿到 SESSDATA")
+        return ""
 
 
 def _cookies(page) -> str:

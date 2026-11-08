@@ -51,6 +51,51 @@ class MediaItem:
     def type_text(self) -> str:
         return "视频" if self.kind == "video" else "图集"
 
+    # ---------- 分 P 信息（B站多P视频在列表阶段就展开） ----------
+    @property
+    def page_index(self) -> int:
+        """当前条目对应的分 P 序号；非分 P 条目返回 0。"""
+        try:
+            return int(self.payload.get("page") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def page_count(self) -> int:
+        """所属视频的总分 P 数（至少为 1）。"""
+        value = self.payload.get("page_count")
+        if value:
+            try:
+                return max(1, int(value))
+            except (TypeError, ValueError):
+                pass
+        pages = self.payload.get("pages")
+        if isinstance(pages, list) and pages:
+            return max(1, len(pages))
+        return 1
+
+    @property
+    def is_multi_page(self) -> bool:
+        return self.page_count > 1
+
+    @property
+    def page_label(self) -> str:
+        """列表用分 P 标记：P3/94；整段视频或单 P 为空串。"""
+        if not self.is_multi_page or not self.page_index:
+            return ""
+        return f"P{self.page_index}/{self.page_count}"
+
+    @property
+    def display_kind(self) -> str:
+        """列表“类型”列：视频·P3/94·合作。"""
+        parts = [self.type_text]
+        label = self.page_label
+        if label:
+            parts.append(label)
+        if self.is_collab:
+            parts.append("合作")
+        return "·".join(parts)
+
     @property
     def is_collab(self) -> bool:
         return bool(self.collaborators or self.collab_flag)

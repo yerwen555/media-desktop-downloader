@@ -131,6 +131,103 @@ def test_results_table_filter(tk_root):
         table.destroy()
 
 
+def test_results_table_expand_item(tk_root):
+    from media_crawler.ui.table import ResultsTable
+
+    table = ResultsTable(tk_root)
+    table.pack()
+    try:
+        aggregate = MediaItem(
+            "bilibili",
+            "bilibili:BV1xx411c7mD",
+            "video",
+            "测试视频（2P）",
+            "UP主",
+            1700000000,
+            125000,
+            payload={"bvid": "BV1xx411c7mD", "pages": [{"cid": 111}, {"cid": 222}]},
+        )
+        other = _items()[0]
+        table.set_items([aggregate, other], {})
+        tk_root.update_idletasks()
+
+        pages = [
+            MediaItem(
+                "bilibili",
+                "bilibili:BV1xx411c7mD:111",
+                "video",
+                "测试视频 - P1 P1",
+                "UP主",
+                1700000000,
+                60000,
+                payload={"bvid": "BV1xx411c7mD", "cid": 111, "page": 1, "page_count": 2},
+            ),
+            MediaItem(
+                "bilibili",
+                "bilibili:BV1xx411c7mD:222",
+                "video",
+                "测试视频 - P2 P2",
+                "UP主",
+                1700000000,
+                65000,
+                payload={"bvid": "BV1xx411c7mD", "cid": 222, "page": 2, "page_count": 2},
+            ),
+        ]
+        new_uids = table.expand_item(
+            aggregate.uid, pages, {"bilibili:BV1xx411c7mD:222": "C:/x/v_P2.mp4"}
+        )
+        tk_root.update_idletasks()
+
+        assert new_uids == [item.uid for item in pages]
+        assert aggregate.uid not in table.items
+        assert table.order == [
+            "bilibili:BV1xx411c7mD:111",
+            "bilibili:BV1xx411c7mD:222",
+            other.uid,
+        ]
+        # 原来整段条目是选中状态，展开后的分P默认继承选中
+        assert set(new_uids) <= table.selected
+        assert table.selected_count() == 3
+        row = table.tree.item("bilibili:BV1xx411c7mD:222", "values")
+        assert row[1] == "视频·P2/2"
+        assert row[8] == "已下载"
+        assert table.tree.exists(aggregate.uid) is False
+    finally:
+        table.destroy()
+
+
+def test_page_downloaded_map_matches_parent_files():
+    """整段下载留下的 xxx_P3.mp4 应能标记出分P 3 已下载。"""
+    import types
+
+    from media_crawler.ui.app import MainWindow
+
+    records = {
+        "bilibili:BV1": {
+            "files": [
+                "D:/dl/up/2026_测试_BV1_P1.mp4",
+                "D:/dl/up/2026_测试_BV1_P3.mp4",
+            ]
+        },
+        "bilibili:BV1:222": {"files": ["D:/dl/up/单独下的_P2.mp4"]},
+    }
+    fake = types.SimpleNamespace(
+        store=types.SimpleNamespace(get=lambda uid: records.get(uid))
+    )
+    pages = [
+        MediaItem("bilibili", "bilibili:BV1:111", "video", "P1", payload={"page": 1, "bvid": "BV1"}),
+        MediaItem("bilibili", "bilibili:BV1:222", "video", "P2", payload={"page": 2, "bvid": "BV1"}),
+        MediaItem("bilibili", "bilibili:BV1:333", "video", "P3", payload={"page": 3, "bvid": "BV1"}),
+        MediaItem("bilibili", "bilibili:BV1:444", "video", "P4", payload={"page": 4, "bvid": "BV1"}),
+    ]
+    found = MainWindow._page_downloaded_map(fake, "bilibili:BV1", pages)
+    assert found == {
+        "bilibili:BV1:111": "D:/dl/up/2026_测试_BV1_P1.mp4",
+        "bilibili:BV1:222": "D:/dl/up/单独下的_P2.mp4",
+        "bilibili:BV1:333": "D:/dl/up/2026_测试_BV1_P3.mp4",
+    }
+
+
 def test_crawl_applies_custom_titles(tk_root):
     import shutil
     import uuid

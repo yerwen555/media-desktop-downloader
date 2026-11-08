@@ -68,13 +68,13 @@ def parse_selection(expression: str, count: int) -> list[int]:
 
 def _print_items(items: list[MediaItem], downloaded: dict[str, str]) -> None:
     print("\n" + "=" * 88)
-    print(f"{'序号':<5}{'类型':<6}{'状态':<8}{'日期':<12}{'时长':<9}标题")
+    print(f"{'序号':<5}{'类型':<14}{'状态':<8}{'日期':<12}{'时长':<9}标题")
     print("-" * 88)
     for index, item in enumerate(items, start=1):
         status = "已下载" if item.uid in downloaded else "未下载"
         title = item.title if len(item.title) <= 40 else item.title[:38] + "…"
         print(
-            f"{index:<6}{item.type_text:<7}{status:<9}{item.date_text:<13}"
+            f"{index:<6}{item.display_kind:<15}{status:<9}{item.date_text:<13}"
             f"{item.length_text:<10}{title}"
         )
     print("=" * 88)
@@ -134,6 +134,9 @@ def run_cli(cfg: AppConfig | None = None) -> int:
     cfg.ensure_dirs()
     log = setup_logging(LOGS_DIR)
     store = DownloadStore(LOGS_DIR.parent / "media.db")
+    warning = getattr(cfg, "dir_warning", "")
+    if warning:
+        print("警告：" + warning)
     print("\n抖音 / B站 视频下载助手（命令行模式）")
     print(config_summary(cfg))
     stats = store.stats()
